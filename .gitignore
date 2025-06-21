@@ -2,3 +2,5 @@ venv/
 *.rss
 *.xml
 *.json
+.env
+anthropic_analysis_report.txt
