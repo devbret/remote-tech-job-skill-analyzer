@@ -1,3 +1,4 @@
+import time
 import os
 import json
 import xml.etree.ElementTree as ET
@@ -7,6 +8,8 @@ from itertools import combinations
 from datetime import datetime
 from nltk.corpus import stopwords
 from nltk import download, ngrams
+import anthropic
+from dotenv import load_dotenv 
 
 # === SETUP ===
 try:
@@ -16,9 +19,7 @@ except LookupError:
     download("stopwords")
 
 DIRECTORY = "./xml_jobs"
-
 OUTPUT_FILENAME = "job_analysis_results.json"
-
 TOP_N_RESULTS = 100
 
 CUSTOM_STOPWORDS = {
@@ -91,7 +92,7 @@ def process_directory(directory):
     if not os.path.exists(directory):
         print(f"Error: Directory '{directory}' not found.")
         return []
-    
+
     files_to_process = [f for f in os.listdir(directory) if f.endswith((".rss", ".xml"))]
     if not files_to_process:
         print(f"Warning: No .rss or .xml files found in '{directory}'.")
@@ -117,13 +118,10 @@ def process_directory(directory):
 def analyze_job_titles(all_job_items, top_n):
     all_titles = [item['title_text'] for item in all_job_items]
     title_tokens = [token for title in all_titles for token in title.lower().split()]
-    
     bigrams = Counter(ngrams(title_tokens, 2))
     trigrams = Counter(ngrams(title_tokens, 3))
-    
     top_bigrams = [{"role": " ".join(b), "frequency": f} for b, f in bigrams.most_common(top_n)]
     top_trigrams = [{"role": " ".join(t), "frequency": f} for t, f in trigrams.most_common(top_n)]
-    
     return {'top_bigrams': top_bigrams, 'top_trigrams': top_trigrams}
 
 def analyze_by_keyword_list(all_tokens, keyword_list):
@@ -142,15 +140,88 @@ def analyze_seniority(all_tokens, seniority_map):
 def analyze_categorized_skills(all_job_items, category_map):
     category_counts = Counter()
     skill_to_category = {skill: category for category, skills in category_map.items() for skill in skills}
-    
     for item in all_job_items:
         mentioned_categories = {skill_to_category[token] for token in item['description_tokens'] if token in skill_to_category}
         category_counts.update(mentioned_categories)
-        
     return [{"category": c, "jobs_mentioned_in": f} for c, f in category_counts.most_common()]
+    
+
+def get_anthropic_analysis(json_data_string):
+    print("\nConnecting to Anthropic API for analysis (streaming)...")
+    print("--- AI-Generated Job Market Analysis ---")
+
+    max_retries = 5
+    initial_wait_time = 1
+    
+    try:
+        client = anthropic.Anthropic()
+        if not client.api_key:
+            raise ValueError("Anthropic API key not found.")
+
+        for attempt in range(max_retries):
+            try:
+                with client.messages.stream(
+                    model="claude-opus-4-20250514",
+                    max_tokens=4300,
+                    messages=[
+                        {"role": "user", "content": f"""
+                    You are an expert career and technology market analyst. Your task is to provide a detailed analysis of the following job market data, which is presented in JSON format. The data is derived from parsing numerous job postings.
+
+                    Based on the JSON data provided below, please generate a comprehensive report that includes:
+                    1.  **Executive Summary:** A high-level overview of the most critical findings. What are the 2-3 most important takeaways for a job seeker or a hiring manager?
+                    2.  **In-Demand Technologies:**
+                        - Identify the top programming languages, cloud platforms, and databases.
+                        - Discuss the most frequent skill pairings based on the "top_skill_cooccurrences". What technology stacks are most common? (e.g., Python with AWS, React with Node.js).
+                    3.  **Job Role Landscape:**
+                        - Analyze the "job_title_analysis" to describe the most common job titles. Are there trends in roles like "Staff Engineer" or "Data Scientist"?
+                        - Comment on the "seniority_level_distribution". What is the ratio of senior to junior roles? What does this imply about the current job market?
+                    4.  **Key Soft Skills & Culture:**
+                        - What are the most requested soft skills?
+                        - Based on the "benefits_and_culture" data, what can you infer about modern work culture? (e.g., prevalence of remote work, common benefits).
+                    5.  **Actionable Insights & Advice:**
+                        - For a **job seeker**: What skills should they focus on learning to be most competitive?
+                        - For a **hiring manager**: What are the key market trends they should be aware of when creating job descriptions and compensation packages?
+
+                    Here is the JSON data:
+
+                    {json_data_string}
+                    """}
+                    ],
+                ) as stream:
+                    analysis_parts = []
+                    for text in stream.text_stream:
+                        print(text, end="", flush=True)
+                        analysis_parts.append(text)
+                
+                print("\n") 
+                print("----------------------------------------")
+                print("Successfully received full analysis from Anthropic.")
+                
+                return "".join(analysis_parts)
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and 'overloaded_error' in e.response.text:
+                    if attempt < max_retries - 1:
+                        wait_time = initial_wait_time * (2 ** attempt)
+                        print(f"\nAPI is overloaded. Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        raise
+                else:
+                    raise
+
+    except Exception as e:
+        print(f"\n--- ANTHROPIC API ERROR ---")
+        print(f"An error occurred: {e}")
+        print("Please check your .env file and network connection.")
+        print("---------------------------\n")
+        return None
+
 
 # === MAIN SCRIPT ===
 if __name__ == "__main__":
+    print("Loading environment variables from .env file...")
+    load_dotenv()
+
     all_jobs = process_directory(DIRECTORY)
     
     if not all_jobs:
@@ -205,9 +276,27 @@ if __name__ == "__main__":
         }
         
         # --- EXPORT TO JSON FILE ---
+        json_output_string = ""
         try:
             with open(OUTPUT_FILENAME, 'w', encoding='utf-8') as f:
                 json.dump(results_data, f, ensure_ascii=False, indent=4)
             print(f"\nAll analyses successfully exported to {OUTPUT_FILENAME}")
+            
+            with open(OUTPUT_FILENAME, 'r', encoding='utf-8') as f:
+                json_output_string = f.read()
+
         except Exception as e:
             print(f"\nError exporting to JSON: {e}")
+
+        # --- SUBMIT FOR AI ANALYSIS ---
+        if json_output_string:
+            analysis_report = get_anthropic_analysis(json_output_string)
+            if analysis_report:
+
+                report_filename = "anthropic_analysis_report.txt"
+                try:
+                    with open(report_filename, 'w', encoding='utf-8') as f:
+                        f.write(analysis_report)
+                    print(f"\nAnalysis report also saved to {report_filename}")
+                except Exception as e:
+                    print(f"\nError saving analysis report: {e}")
